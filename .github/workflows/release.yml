@@ -237,13 +237,23 @@ jobs:
       # status. See the header comment.
       - name: Build release binaries
         run: |
+          # Runner resources (public, contains no source detail): a release
+          # build with fat LTO can exhaust a hosted runner's disk or memory.
+          df -h . | tail -n 1
+          free -m 2>/dev/null | head -n 2 || true
           set -uo pipefail
           status=0
           cargo build --release --locked --target ${{ matrix.target }} -p zabin-server -p zabin-tui -p zabin-cli > build.log 2>&1 || status=$?
-          grep -E '^\s+Finished' build.log | tail -n 1
-          error_count=$(grep -cE '^error(\[E[0-9]+\])?:' build.log)
-          echo "error lines: ${error_count}"
+          # Every grep below tolerates "no match" (|| true): the runner shell is
+          # `bash -e`, so a bare no-match grep would abort this step before the
+          # counts are printed — exactly when they are needed.
+          finished=$(grep -E '^\s+Finished' build.log | tail -n 1 || true)
+          echo "${finished:-(no Finished line: the build did not complete)}"
+          error_count=$(grep -cE '^error(\[E[0-9]+\])?:' build.log || true)
+          killed_count=$(grep -cE 'SIGKILL|signal: 9|[Oo]ut of memory|No space left on device' build.log || true)
+          echo "error lines: ${error_count:-0}; killed/oom/no-space markers: ${killed_count:-0}"
           echo "cargo build exit status: ${status}"
+          if [ "${status}" -ge 128 ]; then echo "cargo was terminated by signal $((status - 128))"; fi
           exit "${status}"
 
       - name: Smoke test binaries
