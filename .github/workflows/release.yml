@@ -1,0 +1,572 @@
+# Zabin release workflow.
+#
+# This file lives at the ROOT of https://github.com/zabin-app/zabin-releases
+# (public). It is generated from zabin-app/zabin's private `release/`
+# directory and synced here verbatim by that repository's
+# `.github/workflows/release-dispatch.yml` on every `vX.Y.Z` tag push — do
+# not edit it directly in zabin-releases: any direct edit is overwritten,
+# without warning, by the next sync. Edit
+# release/.github/workflows/release.yml in zabin-app/zabin instead.
+#
+# One-time setup required in zabin-app/zabin-releases:
+#   - secret `SOURCE_REPO_TOKEN`: a fine-grained PAT with Contents: read on
+#     the private zabin-app/zabin repository. Required because every job
+#     below checks out the PRIVATE source at the release tag to build it,
+#     package the PM skill, and assemble the Docker image build context.
+#     `GITHUB_TOKEN` (this repo's own, ambient token) is used everywhere
+#     else — creating the GitHub Release and pushing to ghcr.io/zabin-app,
+#     both same-org/same-repo operations it is already scoped for.
+#   - after the FIRST successful `image` job push, the ghcr.io package
+#     `zabin` under the zabin-app org is created PRIVATE by default and
+#     must be flipped to Public once by hand (org Settings -> Packages) —
+#     otherwise `docker pull ghcr.io/zabin-app/zabin` fails for everyone
+#     but the org.
+#
+# One-time setup required in zabin-app/zabin (the PRIVATE source repo, not
+# this one): `ZABIN_RELEASES_TOKEN`, the fine-grained PAT used by
+# `release-dispatch.yml` to push this file and the rest of `release/` into
+# zabin-app/zabin-releases, needs the "Workflows: read and write"
+# repository permission on zabin-releases (in addition to Contents:
+# read+write) — pushing a change to a `.github/workflows/*` path requires
+# it even when the token already has Contents write.
+#
+# Public-log discipline: this repository and its Actions logs are public,
+# but the source it builds is private. Raw `cargo build` output can leak
+# source file paths, dependency names/versions, and (on a compile error)
+# source-code snippets into a log anyone can read. The `build` job below
+# therefore always redirects `cargo build` into a local `build.log`, never
+# `cat`s or uploads that file, and prints only the `Finished` line (if the
+# build got that far), a count of error lines, and the exit status — no
+# Compiling lines, no error text, no paths.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.1.0)'
+        required: true
+        type: string
+      source_repo:
+        description: 'Private source repository to build from'
+        required: false
+        type: string
+        default: 'zabin-app/zabin'
+      publish_image:
+        description: 'Build and publish the multi-arch ghcr.io image'
+        required: false
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [zabin-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # Resolves TAG/VERSION from either trigger and fails fast if the private
+  # source cannot be reached at all — every downstream job needs both.
+  preflight:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      base_version: ${{ steps.resolve.outputs.base_version }}
+      source_repo: ${{ steps.resolve.outputs.source_repo }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      publish_image: ${{ steps.resolve.outputs.publish_image }}
+    steps:
+      - name: Fail if SOURCE_REPO_TOKEN is missing
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_REPO_TOKEN}" ]; then
+            echo "::error::secrets.SOURCE_REPO_TOKEN is not set on this repository. It must be a fine-grained PAT with Contents: read on the private source repository (see the header comment of this file)."
+            exit 1
+          fi
+
+      - name: Resolve tag, version and inputs
+        id: resolve
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+          RAW_SOURCE_REPO: ${{ github.event.inputs.source_repo || 'zabin-app/zabin' }}
+          RAW_SOURCE_SHA: ${{ github.event.client_payload.source_sha || '' }}
+          RAW_PUBLISH_IMAGE: ${{ github.event.inputs.publish_image }}
+        run: |
+          set -euo pipefail
+
+          # Every value above is untrusted event data (workflow_dispatch
+          # inputs or repository_dispatch client_payload); it is passed in
+          # through `env:` rather than interpolated into this script, and
+          # validated below before use anywhere else in the workflow.
+          TAG="${RAW_TAG}"
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::tag '${TAG}' does not match ^v[0-9]+.[0-9]+.[0-9]+(-rc.[0-9]+)?\$"
+            exit 1
+          fi
+
+          SOURCE_REPO="${RAW_SOURCE_REPO}"
+          if ! [[ "${SOURCE_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::source_repo '${SOURCE_REPO}' does not match ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\$"
+            exit 1
+          fi
+
+          SOURCE_SHA="${RAW_SOURCE_SHA}"
+          if [ -n "${SOURCE_SHA}" ] && ! [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::source_sha '${SOURCE_SHA}' does not match ^[0-9a-f]{7,40}\$"
+            exit 1
+          fi
+
+          PUBLISH_IMAGE="${RAW_PUBLISH_IMAGE}"
+          if [ -z "${PUBLISH_IMAGE}" ]; then
+            PUBLISH_IMAGE=true
+          fi
+          if [ "${PUBLISH_IMAGE}" != "true" ] && [ "${PUBLISH_IMAGE}" != "false" ]; then
+            echo "::error::publish_image '${PUBLISH_IMAGE}' must be empty, true or false"
+            exit 1
+          fi
+
+          # VERSION keeps any -rc.N suffix (used for asset names and the
+          # image tag); BASE_VERSION strips it and is what must match
+          # [workspace.package].version in Cargo.toml (contract: Cargo.toml
+          # never carries the rc suffix).
+          VERSION="${TAG#v}"
+          BASE_VERSION="${VERSION%-rc.*}"
+          PRERELEASE=false
+          if [ "${VERSION}" != "${BASE_VERSION}" ]; then
+            PRERELEASE=true
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "base_version=${BASE_VERSION}"
+            echo "source_repo=${SOURCE_REPO}"
+            echo "source_sha=${SOURCE_SHA}"
+            echo "prerelease=${PRERELEASE}"
+            echo "publish_image=${PUBLISH_IMAGE}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: preflight
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: linux-arm64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+      SOURCE_REPO: ${{ needs.preflight.outputs.source_repo }}
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ env.TAG }}
+          submodules: true
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Assert workspace version matches the release tag
+        run: |
+          set -euo pipefail
+          V=$(sed -n '/^\[workspace\.package\]/,/^\[/{/^version[[:space:]]*=/{s/.*"\(.*\)".*/\1/p}}' Cargo.toml)
+          if [ "${V}" != "${BASE_VERSION}" ]; then
+            echo "::error::[workspace.package] version (${V}) does not match resolved release base version (${BASE_VERSION}, from tag ${TAG})"
+            exit 1
+          fi
+          echo "workspace version ${V} matches base version ${BASE_VERSION} (tag ${TAG})"
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev libdbus-1-dev pkg-config mold
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # D1b (public-log discipline): never `cat` or upload build.log itself,
+      # and never echo any Compiling line or error text/paths from it — only
+      # the Finished line (if present), a count of error lines, and the exit
+      # status. See the header comment.
+      - name: Build release binaries
+        run: |
+          set -uo pipefail
+          status=0
+          cargo build --release --locked --target ${{ matrix.target }} -p zabin-server -p zabin-tui -p zabin-cli > build.log 2>&1 || status=$?
+          grep -E '^\s+Finished' build.log | tail -n 1
+          error_count=$(grep -cE '^error(\[E[0-9]+\])?:' build.log)
+          echo "error lines: ${error_count}"
+          echo "cargo build exit status: ${status}"
+          exit "${status}"
+
+      - name: Smoke test binaries
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          "${BIN_DIR}/zabin-server" --version
+          "${BIN_DIR}/zabin-tui" --version
+          "${BIN_DIR}/zabctl" --version
+
+      - name: Package release tarball
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          STAGE="zabin-${VERSION}-${{ matrix.artifact }}"
+          mkdir -p "${STAGE}"
+          cp "${BIN_DIR}/zabin-server" "${BIN_DIR}/zabin-tui" "${BIN_DIR}/zabctl" "${STAGE}/"
+          chmod 0755 "${STAGE}/zabin-server" "${STAGE}/zabin-tui" "${STAGE}/zabctl"
+          cp LICENSE "${STAGE}/"
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          else
+            shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          fi
+
+      - name: Upload release tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            zabin-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz
+            zabin-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Upload raw binaries (for the image job)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.artifact }}
+          path: |
+            target/${{ matrix.target }}/release/zabin-server
+            target/${{ matrix.target }}/release/zabin-tui
+            target/${{ matrix.target }}/release/zabctl
+          if-no-files-found: error
+
+  release:
+    needs: [preflight, build, image, manifest]
+    if: always() && needs.build.result == 'success' && (needs.preflight.outputs.publish_image != 'true' || needs.manifest.result == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      SOURCE_REPO: ${{ needs.preflight.outputs.source_repo }}
+      SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+      PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+      PUBLISH_IMAGE: ${{ needs.preflight.outputs.publish_image }}
+    steps:
+      - name: Checkout this repository (install.sh)
+        uses: actions/checkout@v4
+
+      - name: Checkout source at tag (PM skill)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          path: src
+
+      # Honest notes: SOURCE_SHA always comes from the actual checkout, not
+      # the (optional, caller-supplied) repository_dispatch client_payload.
+      # The payload value, if present, is only cross-checked against it.
+      - name: Resolve source SHA
+        run: |
+          set -euo pipefail
+          RESOLVED_SHA=$(git -C src rev-parse HEAD)
+          if [ -n "${SOURCE_SHA}" ] && [ "${SOURCE_SHA}" != "${RESOLVED_SHA}" ]; then
+            echo "::error::client_payload.source_sha (${SOURCE_SHA}) does not match the checked-out tag's actual commit (${RESOLVED_SHA})"
+            exit 1
+          fi
+          echo "SOURCE_SHA=${RESOLVED_SHA}" >> "${GITHUB_ENV}"
+
+      - name: Package the PM skill zip
+        run: |
+          set -euo pipefail
+          (cd src/pm && zip -r -X "${GITHUB_WORKSPACE}/zabin-pm-${VERSION}.zip" zabin-pm -x '*/.DS_Store' '*/__pycache__/*')
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "zabin-pm-${VERSION}.zip" > "zabin-pm-${VERSION}.zip.sha256"
+          else
+            shasum -a 256 "zabin-pm-${VERSION}.zip" > "zabin-pm-${VERSION}.zip.sha256"
+          fi
+
+      - name: Download build artifacts (linux-amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist
+
+      - name: Download build artifacts (linux-arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: dist
+
+      - name: Download build artifacts (darwin-arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-arm64
+          path: dist
+
+      - name: Assemble SHA256SUMS
+        run: |
+          set -euo pipefail
+          : > SHA256SUMS
+          for f in dist/*.tar.gz.sha256; do
+            cat "${f}" >> SHA256SUMS
+          done
+          cat "zabin-pm-${VERSION}.zip.sha256" >> SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Built from ${SOURCE_REPO}@${TAG} (${SOURCE_SHA::12})
+
+          Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | bash
+          PM skill: zabin-pm-${VERSION}.zip (upload to claude.ai / Claude desktop as a custom skill)"
+
+          # The image line is only true when this run actually published one
+          # (the manifest job, which release now depends on, only runs when
+          # publish_image is true).
+          if [ "${PUBLISH_IMAGE}" = "true" ]; then
+            NOTES="${NOTES}
+          Image: ghcr.io/zabin-app/zabin:${VERSION}"
+          fi
+
+          extra_args=()
+          if [ "${PRERELEASE}" = "true" ]; then
+            extra_args+=(--prerelease)
+          fi
+
+          # Idempotent: re-running this job against an already-released tag
+          # (e.g. a retry) must not fail on a duplicate `gh release create`.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists, skipping create"
+          else
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "Zabin ${VERSION}" \
+              --notes "${NOTES}" \
+              "${extra_args[@]}"
+          fi
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+            dist/*.tar.gz \
+            dist/*.tar.gz.sha256 \
+            "zabin-pm-${VERSION}.zip" \
+            "zabin-pm-${VERSION}.zip.sha256" \
+            SHA256SUMS \
+            install.sh
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        continue-on-error: true
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            zabin-pm-${{ env.VERSION }}.zip
+
+  image:
+    needs: [preflight, build]
+    if: needs.preflight.outputs.publish_image == 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      SOURCE_REPO: ${{ needs.preflight.outputs.source_repo }}
+    steps:
+      # Contract D6: build context is the source checkout root with .agents
+      # initialised (submodules: true); the Dockerfile COPYs
+      # dist/linux-${TARGETARCH}/{zabin-server,zabin-tui,zabctl} and .agents.
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ env.TAG }}
+          submodules: true
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Download linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: dist/linux-${{ matrix.arch }}
+
+      - name: chmod binaries
+        run: chmod +x dist/linux-${{ matrix.arch }}/*
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/zabin-app/zabin
+          tags: |
+            type=raw,value=${{ env.VERSION }}
+
+      # ARG TARGETARCH is populated automatically by buildx for the
+      # platform being built; the Dockerfile (contract D6) reads it to pick
+      # dist/linux-${TARGETARCH}/.
+      #
+      # Docker's documented push-by-digest pattern (see
+      # https://docs.docker.com/build/ci/github-actions/multi-platform/)
+      # uses a bare image name in `tags` here, not the tagged refs from the
+      # metadata step above — those are applied later by `docker buildx
+      # imagetools create` in the manifest job. The metadata step is kept
+      # only to produce OCI labels.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/release/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          tags: ghcr.io/zabin-app/zabin
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  manifest:
+    needs: [preflight, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=(-t "ghcr.io/zabin-app/zabin:${VERSION}")
+          if [ "${PRERELEASE}" != "true" ]; then
+            tags+=(-t "ghcr.io/zabin-app/zabin:latest")
+          fi
+          refs=()
+          for f in *; do
+            refs+=("ghcr.io/zabin-app/zabin@sha256:${f}")
+          done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Inspect manifest
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "ghcr.io/zabin-app/zabin:${VERSION}" > inspect.txt
+          cat inspect.txt
+          for plat in linux/amd64 linux/arm64; do
+            if ! grep -q "${plat}" inspect.txt; then
+              echo "::error::manifest for ghcr.io/zabin-app/zabin:${VERSION} is missing platform ${plat}"
+              exit 1
+            fi
+          done
