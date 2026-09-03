@@ -205,7 +205,7 @@ jobs:
       - name: Assert workspace version matches the release tag
         run: |
           set -euo pipefail
-          V=$(sed -n '/^\[workspace\.package\]/,/^\[/{/^version[[:space:]]*=/{s/.*"\(.*\)".*/\1/p}}' Cargo.toml)
+          V=$(awk -F'"' '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0} s && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)  # awk, not sed: BSD sed on macOS rejects the {…p}} form
           if [ "${V}" != "${BASE_VERSION}" ]; then
             echo "::error::[workspace.package] version (${V}) does not match resolved release base version (${BASE_VERSION}, from tag ${TAG})"
             exit 1
