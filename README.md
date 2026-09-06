@@ -9,12 +9,14 @@ This repository is the public release surface for [Zabin](https://github.com/zab
 ### Prebuilt binary
 
 ```bash
-curl -fsSL https://github.com/zabin-app/zabin-releases/releases/latest/download/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zabin-app/zabin-releases/main/install.sh | bash
 ```
+
+That URL is this repository's default branch, which every tag push re-syncs, so it always serves the newest installer regardless of whether the newest release is a pre-release (GitHub's `releases/latest/...` URLs resolve only once a non-prerelease release exists). To fetch the installer that shipped with a specific release instead, use the tag-pinned asset URL that the release page prints: `https://github.com/zabin-app/zabin-releases/releases/download/vX.Y.Z/install.sh`.
 
 Flags (pass after `bash -s --`, e.g. `... | bash -s -- --with-server`):
 
-- `--version vX.Y.Z` — install a specific release instead of the latest (default: latest)
+- `--version vX.Y.Z` — install a specific release (default: the newest stable release, or the newest pre-release while no stable one exists)
 - `--prefix DIR` — installation directory (default: `$HOME/.local`; also settable via `ZABIN_INSTALL_PREFIX`)
 - `--with-server` — also install `zabin-server` (by default only `zabin-tui` and `zabctl` are installed)
 - `--help` — show usage

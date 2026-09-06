@@ -3,7 +3,7 @@
 # (and optionally zabin-server) release binaries from
 # https://github.com/zabin-app/zabin-releases.
 #
-#   curl -fsSL https://github.com/zabin-app/zabin-releases/releases/latest/download/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zabin-app/zabin-releases/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --version v0.1.0 --with-server --prefix /opt/zabin
 #
 # Everything lives inside main(), called at the very end, so a script piped
@@ -13,7 +13,7 @@
 # so it must not be invoked via `sh`. The guard itself is POSIX `sh`/dash
 # safe — it is the only thing that runs before we know which shell we are in.
 if [ -z "${BASH_VERSION:-}" ]; then
-    echo "install.sh: run this script with bash (curl -fsSL https://github.com/zabin-app/zabin-releases/releases/latest/download/install.sh | bash)" >&2
+    echo "install.sh: run this script with bash (curl -fsSL https://raw.githubusercontent.com/zabin-app/zabin-releases/main/install.sh | bash)" >&2
     exit 2
 fi
 
@@ -27,7 +27,8 @@ Downloads and installs prebuilt Zabin release binaries from
 https://github.com/zabin-app/zabin-releases.
 
 Options:
-  --version vX.Y.Z      Release to install (default: latest)
+  --version vX.Y.Z      Release to install (default: the newest stable release,
+                        or the newest pre-release while no stable one exists)
   --prefix DIR          Installation directory (default: $HOME/.local)
                         Can also be set via ZABIN_INSTALL_PREFIX
   --with-server         Also install zabin-server
@@ -35,6 +36,8 @@ Options:
 
 Behavior:
   - Detects OS/arch (Linux x86_64/aarch64, macOS arm64)
+  - Resolves the release to install: --version if given, else the newest
+    stable release, else (github.com only) the newest pre-release
   - Downloads the matching release tarball + SHA256SUMS and verifies the
     checksum before installing anything
   - Installs zabin-tui + zabctl (+ zabin-server with --with-server) to
@@ -57,6 +60,7 @@ Environment:
   ZABIN_INSTALL_PREFIX    Alternative to --prefix DIR
   ZABIN_RELEASE_BASE_URL  Override the release base URL (testing / mirrors).
                           Default: https://github.com/zabin-app/zabin-releases/releases
+                          A mirror with no stable release needs --version.
 EOF
 }
 
@@ -166,6 +170,57 @@ check_path() {
     esac
 }
 
+# Resolve the release tag to install when --version was not given. Echoes
+# the tag on success.
+#
+# GitHub's "latest" release is the newest non-prerelease, non-draft release:
+# <base>/latest redirects to <base>/tag/<tag> when one exists and to the
+# plain <base> index when every release so far is a pre-release (an rc.N
+# cycle before the first stable tag). Following that redirect works on any
+# GitHub-shaped mirror; only the pre-release fallback needs the github.com
+# REST API, so a mirror with no stable release must pin --version.
+resolve_release_tag() {
+    local base_url="$1"
+
+    local effective
+    effective="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$base_url/latest" 2> /dev/null || true)"
+    case "$effective" in
+        */releases/tag/*)
+            echo "${effective##*/}"
+            return 0
+            ;;
+    esac
+
+    local repo=""
+    case "$base_url" in
+        https://github.com/*/*/releases)
+            repo="${base_url#https://github.com/}"
+            repo="${repo%/releases}"
+            ;;
+    esac
+    if [[ -z "$repo" ]] || [[ "$repo" == */*/* ]]; then
+        err "No stable release found at $base_url"
+        echo "Pass --version vX.Y.Z to install a specific release." >&2
+        return 1
+    fi
+
+    # Newest release of any kind, pre-releases included (drafts are not
+    # visible without authentication). Parsed with grep/sed so the installer
+    # keeps no jq dependency; the caller validates the tag grammar before
+    # the value reaches a URL or filename.
+    local tag
+    tag="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$repo/releases?per_page=1" 2> /dev/null \
+        | grep -m1 -o '"tag_name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+    if [[ -z "$tag" ]]; then
+        err "No release found for $repo (no stable release, and the GitHub API lookup failed)"
+        echo "Pass --version vX.Y.Z to install a specific release." >&2
+        return 1
+    fi
+    echo "Note: no stable release published yet; installing newest pre-release $tag" >&2
+    echo "$tag"
+}
+
 main() {
     local version=""
     local prefix="${ZABIN_INSTALL_PREFIX:-$HOME/.local}"
@@ -212,6 +267,11 @@ main() {
         esac
     done
 
+    if [[ -n "$version" ]] && ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+        err "Invalid --version '$version' (expected vX.Y.Z or vX.Y.Z-rc.N)"
+        exit 2
+    fi
+
     if [[ "$EUID" -eq 0 ]] && [[ $prefix_explicit -eq 0 ]]; then
         err "Refusing to install as root to $prefix"
         echo "Use --prefix (or ZABIN_INSTALL_PREFIX) to explicitly specify an installation directory" >&2
@@ -231,15 +291,27 @@ main() {
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
 
-    local download_base
-    if [[ -n "$version" ]]; then
-        download_base="$base_url/download/$version"
-    else
-        download_base="$base_url/latest/download"
-    fi
-
     echo "=== Resolving release ==="
     echo "Platform: $platform"
+
+    # Every download below is addressed by a concrete tag: GitHub's
+    # <base>/latest/download/<asset> only exists once a non-prerelease
+    # release does, so it cannot be the default during an rc.N cycle.
+    local tag
+    if [[ -n "$version" ]]; then
+        tag="$version"
+    elif ! tag="$(resolve_release_tag "$base_url")"; then
+        exit 1
+    fi
+    # A resolved tag came from network content and is about to become a URL
+    # path segment and a filename component: admit only the release tag
+    # grammar (an explicit --version was already checked the same way).
+    if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+        err "Unexpected release tag '$tag' (expected vX.Y.Z or vX.Y.Z-rc.N)"
+        exit 1
+    fi
+    local download_base="$base_url/download/$tag"
+    echo "Release: $tag"
     echo "Base URL: $download_base"
 
     local sums_file="$tmpdir/SHA256SUMS"
@@ -249,18 +321,14 @@ main() {
     fi
 
     # Build the tarball name we expect ourselves, from the release naming
-    # convention plus the platform we just detected (and the requested
-    # version, when pinned). We never trust the SHA256SUMS filename field
-    # verbatim: an untrusted or corrupted sums file could otherwise name a
-    # path like "../x.tar.gz" and smuggle a traversal into the -o path
-    # below. Only a version segment is left as a pattern for the "latest"
-    # case, and it is restricted to digits/letters/dots/dashes — no slashes.
-    local version_segment
-    if [[ -n "$version" ]]; then
-        version_segment="${version#v}"
-    else
-        version_segment='[0-9][0-9A-Za-z._-]*'
-    fi
+    # convention plus the platform we just detected and the resolved tag.
+    # We never trust the SHA256SUMS filename field verbatim: an untrusted
+    # or corrupted sums file could otherwise name a path like "../x.tar.gz"
+    # and smuggle a traversal into the -o path below. The tag is always
+    # concrete here, so the expected name is exact (dots escaped for the
+    # regex match below).
+    local version_segment="${tag#v}"
+    version_segment="${version_segment//./\\.}"
     local expected_name_re="zabin-${version_segment}-${platform}\\.tar\\.gz"
 
     local sums_line_count
