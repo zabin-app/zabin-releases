@@ -66,6 +66,10 @@ Each tarball and the zip also ship an individual `<file>.sha256`, and both carry
 
 A project manager who wants to watch the pipeline from their own AI desktop agent (Claude.ai, Claude Desktop, or another [agentskills.io](https://agentskills.io)-compatible host) downloads `zabin-pm-X.Y.Z.zip` from the release page and uploads it as a **custom skill** in the host's Chat/Skills settings. The zip's root folder is `zabin-pm/`; its own `README.md` and `SKILL.md` — installed with it — are the authority on what it does and how to connect it to a running Zabin server's PM MCP surface (`hosts.md` inside the skill covers host setup).
 
+## Configuration
+
+[`CONFIG.md`](./CONFIG.md) maps every configuration file Zabin reads — the machine-wide `~/.zabin/tui.toml`, `~/.zabin/zabctl.toml` and `~/.zabin/agents.toml`, the per-project `.zabin/project.toml` marker and its gitignored `.zabin/local.toml` override, the rendered `.mcp.json`, and the daemon's flags, variables and token files — with the precedence chains that decide which layer wins for `zabin-tui`, `zabctl` and the MCP adapters.
+
 ## Docker quickstart
 
 See the [Docker](#docker) section above for the one-line `docker run`. The image bundles `zabin-server` and `zabin-tui` behind SSH; secrets (SSH keys, root password) are supplied via environment variables at container start, and the pipeline database persists in the `zabin-data` volume across restarts.
