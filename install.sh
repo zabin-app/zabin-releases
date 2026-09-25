@@ -35,7 +35,7 @@ Options:
   --help                Show this help message
 
 Behavior:
-  - Detects OS/arch (Linux x86_64/aarch64, macOS arm64)
+  - Detects OS/arch (Linux x86_64/aarch64, macOS arm64); Windows users: see the zip asset
   - Resolves the release to install: --version if given, else the newest
     stable release, else (github.com only) the newest pre-release
   - Downloads the matching release tarball + SHA256SUMS and verifies the
@@ -98,6 +98,10 @@ detect_platform() {
                     return 1
                     ;;
             esac
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            err "Windows is not installed by this script. Download zabin-<version>-windows-amd64.zip from https://github.com/zabin-app/zabin-releases/releases, verify it against SHA256SUMS (certutil -hashfile <file> SHA256, or Get-FileHash), unzip it, and put the folder on PATH. Note: zabctl agents and zabctl project render-mcp are Unix-only."
+            return 1
             ;;
         *)
             err "Unsupported OS: $os"
@@ -327,9 +331,8 @@ main() {
     # and smuggle a traversal into the -o path below. The tag is always
     # concrete here, so the expected name is exact (dots escaped for the
     # regex match below).
-    local version_segment="${tag#v}"
-    version_segment="${version_segment//./\\.}"
-    local expected_name_re="zabin-${version_segment}-${platform}\\.tar\\.gz"
+    local expected_name="zabin-${tag#v}-${platform}.tar.gz"
+    local expected_name_re="${expected_name//./\\.}"
 
     local sums_line_count
     sums_line_count="$(grep -cE "^[0-9a-fA-F]+[[:space:]]+${expected_name_re}\$" "$sums_file" || true)"
@@ -351,6 +354,12 @@ main() {
     # out a name containing a path separator, never let anything derived
     # from file content reach a `curl -o` path without a basename applied.
     tarball_name="$(basename -- "$tarball_name")"
+
+    # Verify that the filename (after basename) matches what we expect.
+    if [[ "$tarball_name" != "$expected_name" ]]; then
+        err "SHA256SUMS filename mismatch: expected '$expected_name' but got '$tarball_name'"
+        exit 1
+    fi
 
     echo ""
     echo "=== Downloading $tarball_name ==="

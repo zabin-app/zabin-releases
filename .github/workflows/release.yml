@@ -35,9 +35,12 @@
 # source file paths, dependency names/versions, and (on a compile error)
 # source-code snippets into a log anyone can read. The `build` job below
 # therefore always redirects `cargo build` into a local `build.log`, never
-# `cat`s or uploads that file, and prints only the `Finished` line (if the
-# build got that far), a count of error lines, and the exit status — no
-# Compiling lines, no error text, no paths.
+# `cat`s or uploads that file, and prints only: the runner's `df` disk-space
+# line, the `free` memory lines (when available), the `Finished` line (if
+# the build got that far), a count of error lines, a count of
+# killed/oom/no-space markers, the `cargo build` exit status, and (when the
+# build was signal-terminated) the signal number — no Compiling lines, no
+# error text, no source paths.
 
 name: Release
 
@@ -167,14 +170,47 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: linux-amd64
+            exe: ''
+            archive: tar.gz
+            timeout: 120
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: linux-arm64
+            exe: ''
+            archive: tar.gz
+            timeout: 120
           - os: macos-15
             target: aarch64-apple-darwin
             artifact: darwin-arm64
+            exe: ''
+            archive: tar.gz
+            timeout: 120
+          # Windows leg (R8: its failure blocks the release by design, same
+          # as any other build leg — there is no partial/best-effort mode).
+          # msvc, not gnu: ort (onnxruntime) ships a static prebuilt only
+          # for x86_64-pc-windows-msvc, and MSVC is preinstalled on hosted
+          # Windows runners. windows-2022 is pinned rather than
+          # windows-latest for the same reason as check-windows in
+          # .github/workflows/ci.yml: windows-latest now maps to
+          # windows-2025/VS2026, an untested toolchain. Packaging uses 7z
+          # (bundled on hosted Windows runners) and the Git-Bash-provided
+          # sha256sum rather than switching to pwsh, so this leg's steps
+          # stay byte-identical bash to the other three (see the
+          # job-level `defaults.run.shell: bash` below).
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact: windows-amd64
+            exe: .exe
+            archive: zip
+            timeout: 180
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout }}
+    defaults:
+      run:
+        # Windows' default shell is pwsh; every existing step below is
+        # written in bash. Force bash on all four legs rather than
+        # rewriting the Windows leg's steps in PowerShell.
+        shell: bash
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -223,6 +259,12 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -237,11 +279,14 @@ jobs:
       # status. See the header comment.
       - name: Build release binaries
         run: |
+          set -uo pipefail
           # Runner resources (public, contains no source detail): a release
           # build with fat LTO can exhaust a hosted runner's disk or memory.
-          df -h . | tail -n 1
+          # Both `|| true`: `df`'s column layout differs enough on Windows
+          # Git Bash that a parse hiccup shouldn't fail the step, and
+          # `free` is absent there entirely.
+          df -h . | tail -n 1 || true
           free -m 2>/dev/null | head -n 2 || true
-          set -uo pipefail
           status=0
           cargo build --release --locked --target ${{ matrix.target }} -p zabin-server -p zabin-tui -p zabin-cli > build.log 2>&1 || status=$?
           # Every grep below tolerates "no match" (|| true): the runner shell is
@@ -260,33 +305,38 @@ jobs:
         run: |
           set -euo pipefail
           BIN_DIR="target/${{ matrix.target }}/release"
-          "${BIN_DIR}/zabin-server" --version
-          "${BIN_DIR}/zabin-tui" --version
-          "${BIN_DIR}/zabctl" --version
+          "${BIN_DIR}/zabin-server${{ matrix.exe }}" --version
+          "${BIN_DIR}/zabin-tui${{ matrix.exe }}" --version
+          "${BIN_DIR}/zabctl${{ matrix.exe }}" --version
 
-      - name: Package release tarball
+      - name: Package release archive
         run: |
           set -euo pipefail
           BIN_DIR="target/${{ matrix.target }}/release"
           STAGE="zabin-${VERSION}-${{ matrix.artifact }}"
           mkdir -p "${STAGE}"
-          cp "${BIN_DIR}/zabin-server" "${BIN_DIR}/zabin-tui" "${BIN_DIR}/zabctl" "${STAGE}/"
-          chmod 0755 "${STAGE}/zabin-server" "${STAGE}/zabin-tui" "${STAGE}/zabctl"
+          cp "${BIN_DIR}/zabin-server${{ matrix.exe }}" "${BIN_DIR}/zabin-tui${{ matrix.exe }}" "${BIN_DIR}/zabctl${{ matrix.exe }}" "${STAGE}/"
           cp LICENSE "${STAGE}/"
-          tar -czf "${STAGE}.tar.gz" "${STAGE}"
-          if command -v sha256sum > /dev/null 2>&1; then
-            sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            chmod 0755 "${STAGE}/zabin-server" "${STAGE}/zabin-tui" "${STAGE}/zabctl"
+            tar -czf "${STAGE}.tar.gz" "${STAGE}"
+            if command -v sha256sum > /dev/null 2>&1; then
+              sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+            else
+              shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+            fi
           else
-            shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+            7z a -tzip "${STAGE}.zip" "${STAGE}" > /dev/null
+            sha256sum --text "${STAGE}.zip" > "${STAGE}.zip.sha256"
           fi
 
-      - name: Upload release tarball
+      - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            zabin-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz
-            zabin-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz.sha256
+            zabin-${{ env.VERSION }}-${{ matrix.artifact }}.${{ matrix.archive }}
+            zabin-${{ env.VERSION }}-${{ matrix.artifact }}.${{ matrix.archive }}.sha256
           if-no-files-found: error
 
       - name: Upload raw binaries (for the image job)
@@ -369,11 +419,17 @@ jobs:
           name: darwin-arm64
           path: dist
 
+      - name: Download build artifacts (windows-amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-amd64
+          path: dist
+
       - name: Assemble SHA256SUMS
         run: |
           set -euo pipefail
           : > SHA256SUMS
-          for f in dist/*.tar.gz.sha256; do
+          for f in dist/*.tar.gz.sha256 dist/*.zip.sha256; do
             cat "${f}" >> SHA256SUMS
           done
           cat "zabin-pm-${VERSION}.zip.sha256" >> SHA256SUMS
@@ -387,6 +443,7 @@ jobs:
           NOTES="Built from ${SOURCE_REPO}@${TAG} (${SOURCE_SHA::12})
 
           Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | bash
+          Windows: download zabin-${VERSION}-windows-amd64.zip (zabin-server.exe, zabin-tui.exe, zabctl.exe, LICENSE). \`zabctl agents\` and \`project render-mcp\` are Unix-only and unsupported on Windows.
           PM skill: zabin-pm-${VERSION}.zip (upload to claude.ai / Claude desktop as a custom skill)"
 
           # The image line is only true when this run actually published one
@@ -421,6 +478,8 @@ jobs:
           gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
             dist/*.tar.gz \
             dist/*.tar.gz.sha256 \
+            dist/*.zip \
+            dist/*.zip.sha256 \
             "zabin-pm-${VERSION}.zip" \
             "zabin-pm-${VERSION}.zip.sha256" \
             SHA256SUMS \
@@ -432,6 +491,7 @@ jobs:
         with:
           subject-path: |
             dist/*.tar.gz
+            dist/*.zip
             zabin-pm-${{ env.VERSION }}.zip
 
   image:
