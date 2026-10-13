@@ -42,6 +42,7 @@ satellites.
 
 <checkout>/                        one per project
 ├── .zabin/project.toml            COMMITTED marker: project_id + server_url + mcp_url + mcp_worker_url
+│                                  (+ optional agent_packs)
 ├── .zabin/local.toml              GITIGNORED overlay: same keys, key by key, plus token_file
 ├── .mcp.json                      rendered by `zabctl project render-mcp` from the two files above
 └── .envrc / .zabinenv             optional direnv recipe that exports ZABIN_MCP_TOKEN & co.
@@ -57,7 +58,7 @@ satellites.
 | `~/.zabin/tui.toml` | yes, all four sections | no | no | indirectly: `[daemon]` becomes its argv | no |
 | `~/.zabin/zabctl.toml` | no | yes | no (dispatched before it is read) | no | no |
 | `~/.zabin/agents.toml` | no | no | yes: remembered repo, clone dir, clients | no | no |
-| `.zabin/project.toml` | `project_id`, `server_url`, `token_file` (reported, never opened) | `server_url`, `token_file` (reported, never opened) | `mcp_url`, `mcp_worker_url` (loopback only) | no | no |
+| `.zabin/project.toml` | `project_id`, `server_url`, `token_file` (reported, never opened) | `server_url`, `token_file` (reported, never opened) | `mcp_url`, `mcp_worker_url` (loopback only), `agent_packs` | no | no |
 | `.zabin/local.toml` | `project_id`, `server_url`, `token_file` | `server_url`, `token_file` | `mcp_url`, `mcp_worker_url` | no | no |
 | `.mcp.json` | no | no | written by `render-mcp` | no | yes: server URLs + `${ZABIN_MCP_TOKEN}` refs |
 | token files | via `[auth] token_file` / marker `token_file` | via `token_file` | `doctor --mode live` only | `--mcp-*-token-file`, `--master-key-file` | via the exported variable |
@@ -359,6 +360,22 @@ because git confirms the file is untracked.
 in each checkout, and export the four `ZABIN_MCP_*` variables (direnv above). To point the adapters
 at a daemon on non-default ports, record the URLs in `local.toml` or pass
 `--mcp-endpoint`/`--mcp-worker-endpoint`.
+
+**A creative project (studio pack).** Agent packs group the bundled roles: `software` is a global
+pack (the default home install), `studio` (producer, reviewers, bible keeper and the `/studio` skill
+for books, YouTube and film work) is project-only. Record it in the project marker and install into
+that checkout, never into your home directory:
+
+```bash
+zabctl project init --project-id prj_abc123 --agent-packs studio
+zabctl agents install --claude --destination "$PWD" --mode dry-run   # every path under ./.claude/
+zabctl agents install --claude --destination "$PWD"
+zabctl project render-mcp --claude
+```
+
+`agent_packs` is read from `project.toml` only. `--pack <id>` overrides it for one run; installing
+a project-only pack into the home directory is refused; dropping a pack that is still installed needs
+`--prune`. A remote daemon's MCP URLs go in the gitignored `local.toml`, as above.
 
 **A team.** Bind the daemon inside an encrypted overlay (or with `--tls-cert`/`--tls-key`), create
 users on loopback, issue each person a `grpc` token they save as `[auth] token_file`, and let members
