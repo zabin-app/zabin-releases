@@ -377,6 +377,29 @@ zabctl project render-mcp --claude
 a project-only pack into the home directory is refused; dropping a pack that is still installed needs
 `--prune`. A remote daemon's MCP URLs go in the gitignored `local.toml`, as above.
 
+**A second machine (MacBook).** The daemon stays on the machine that holds the checkouts; the MacBook is a
+client and agent host. Bind the daemon on an encrypted overlay (or behind a TLS proxy), start it with
+`--mcp-insecure-allow-remote` (the MCP listeners have no TLS of their own; add the overlay name to
+`--mcp-allowed-host` too), and on the daemon's loopback issue yourself `grpc`, `mcp` and `mcp_worker`
+tokens from the TUI's Identity section. Then on the MacBook, with `<tailnet-host>` standing for the
+daemon's overlay address and each token saved to a `0600` file:
+
+- `~/.zabin/tui.toml`: `[connection] server_url = "http://<tailnet-host>:50051"` and `[auth] token_file`.
+- `~/.zabin/zabctl.toml`: `zabctl config set server.endpoint http://<tailnet-host>:50051` and
+  `zabctl config set token_file ...`. This covers `zabctl` run outside a project.
+- Each project's gitignored `.zabin/local.toml`: `server_url = "http://<tailnet-host>:50051"`,
+  `token_file = "..."`, `mcp_url = "http://<tailnet-host>:50052/mcp"` and
+  `mcp_worker_url = "http://<tailnet-host>:50053/mcp-worker"`, then `zabctl project render-mcp` so
+  `.mcp.json` points at the overlay (a committed `project.toml` may only name loopback). The
+  `server_url` here is required whenever the committed `project.toml` carries its own: for
+  `zabctl` the marker outranks `~/.zabin/zabctl.toml`, so without it `zabctl` (and the Claude Code
+  hooks and `zabctl channel`, which dial a committed `server_url` when it is loopback) would aim at
+  the MacBook itself. The PM listener is `/mcp-pm` and is configured by hand in a PM's host.
+
+A session's `host` is the machine it runs on (`gethostname`), so Claude Code hooks (`zabctl presence`)
+and the agent's MCP `announce_presence` on the MacBook converge on the MacBook's hostname; a session
+announced from the daemon machine is a different one.
+
 **A team.** Bind the daemon inside an encrypted overlay (or with `--tls-cert`/`--tls-key`), create
 users on loopback, issue each person a `grpc` token they save as `[auth] token_file`, and let members
 self-issue their own MCP tokens from the TUI. The full checklist is `docs/DAEMON-CONTROL.md`'s
