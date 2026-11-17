@@ -265,8 +265,13 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain CI uses. Rust 1.100 changed the build
+      # directory layout, and ort-sys 2.0.0-rc.12's build script (which
+      # places DirectML.dll next to the executable) panics on it, so the
+      # Windows leg failed. Bump together with the pin in ci.yml.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
